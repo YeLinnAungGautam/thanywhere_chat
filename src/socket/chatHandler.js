@@ -3,6 +3,7 @@ const Message = require("../models/Message");
 const Conversation = require("../models/Conversation");
 const UserCache = require("../models/UserCache");
 const logger = require("../utils/logger");
+const Notification = require("../models/Notification");
 
 const connectedUsers = new Map();
 
@@ -41,7 +42,7 @@ const chatHandler = (io) => {
               Accept: "application/json",
             },
             timeout: 5000,
-          }
+          },
         );
 
         console.log("Admin response status:", adminResponse.status);
@@ -56,7 +57,7 @@ const chatHandler = (io) => {
         console.log(
           "⚠️ Admin verification failed:",
           adminError.response?.status,
-          adminError.message
+          adminError.message,
         );
       }
 
@@ -73,7 +74,7 @@ const chatHandler = (io) => {
                 Accept: "application/json",
               },
               timeout: 5000,
-            }
+            },
           );
 
           console.log("User response status:", userResponse.status);
@@ -88,7 +89,7 @@ const chatHandler = (io) => {
           console.log(
             "⚠️ User verification failed:",
             userError.response?.status,
-            userError.message
+            userError.message,
           );
           console.log("Error response:", userError.response?.data);
         }
@@ -133,6 +134,12 @@ const chatHandler = (io) => {
 
     connectedUsers.set(userKey, socket.id);
 
+    // ✅ ADD THIS - Join user's personal room for notifications
+    const personalRoom = `user_${socket.user.id}_${socket.user.type}`;
+    socket.join(personalRoom);
+
+    logger.info(`User joined personal room: ${personalRoom}`);
+
     // Update online status
     try {
       await UserCache.findByIdAndUpdate(
@@ -151,7 +158,7 @@ const chatHandler = (io) => {
           lastSeen: new Date(),
           syncedAt: new Date(),
         },
-        { upsert: true, new: true }
+        { upsert: true, new: true },
       );
 
       io.emit("user_status", {
@@ -161,6 +168,47 @@ const chatHandler = (io) => {
         isOnline: true,
         timestamp: new Date(),
       });
+
+      // ✅ ADD THIS - Send pending notifications
+      console.log(
+        `📬 Checking pending notifications for ${socket.user.name}...`,
+      );
+
+      const pendingNotifications = await Notification.find({
+        userId: socket.user.id,
+        userType: socket.user.type,
+        isRead: false,
+      })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean();
+
+      if (pendingNotifications.length > 0) {
+        console.log(
+          `📬 Sending ${pendingNotifications.length} pending notifications`,
+        );
+
+        socket.emit("pending_notifications", {
+          notifications: pendingNotifications,
+          count: pendingNotifications.length,
+        });
+
+        // Mark as delivered
+        await Notification.updateMany(
+          {
+            userId: socket.user.id,
+            userType: socket.user.type,
+            isRead: false,
+          },
+          {
+            $set: { deliveredAt: new Date() },
+          },
+        );
+
+        console.log(`✅ Notifications marked as delivered`);
+      } else {
+        console.log(`ℹ️ No pending notifications`);
+      }
     } catch (error) {
       logger.error("Error updating user status:", error);
     }
@@ -248,20 +296,42 @@ const chatHandler = (io) => {
       try {
         const { conversationId, message, messageType = "text", replyTo } = data;
 
+        console.log("📨 Received send_message event");
+        console.log("   From:", socket.user.name);
+        console.log("   Conversation:", conversationId);
+        console.log("   Message:", message?.substring(0, 50));
+
         if (!conversationId || !message || message.trim().length === 0) {
+          console.error("❌ Invalid message data");
           return socket.emit("error", { message: "Invalid message data" });
         }
 
         const conversation = await Conversation.findById(conversationId);
 
         if (!conversation) {
+          console.error("❌ Conversation not found:", conversationId);
           return socket.emit("error", { message: "Conversation not found" });
         }
 
         if (!conversation.isParticipant(socket.user.id, socket.user.type)) {
+          console.error("❌ User not a participant");
           return socket.emit("error", { message: "Access denied" });
         }
 
+        // ✅ CRITICAL FIX - Ensure user is in room before sending
+        const roomName = `conversation_${conversationId}`;
+        const isInRoom = socket.rooms.has(roomName);
+
+        if (!isInRoom) {
+          console.log(
+            `⚠️ User ${socket.user.name} not in room, joining now...`,
+          );
+          socket.join(roomName);
+        }
+
+        console.log(`✅ User in room: ${roomName}`);
+
+        // Save message
         const newMessage = new Message({
           conversationId,
           senderId: socket.user.id,
@@ -275,7 +345,9 @@ const chatHandler = (io) => {
         });
 
         await newMessage.save();
+        console.log("✅ Message saved to database:", newMessage._id);
 
+        // Update conversation
         conversation.lastMessage = {
           message: message.trim(),
           senderId: socket.user.id,
@@ -284,14 +356,99 @@ const chatHandler = (io) => {
         };
         conversation.updatedAt = new Date();
         await conversation.save();
+        console.log("✅ Conversation updated");
+
+        // Get room info
+        const room = io.sockets.adapter.rooms.get(roomName);
+        const memberCount = room ? room.size : 0;
+
+        console.log(`📤 Emitting to room: ${roomName}`);
+        console.log(`   Members in room: ${memberCount}`);
 
         logger.socket("send_message", {
           messageId: newMessage._id,
           conversationId,
           sender: socket.user.name,
+          roomMembers: memberCount,
         });
 
-        io.to(`conversation_${conversationId}`).emit("new_message", {
+        // ✅ ========================================
+        // ✅ ADD THIS SECTION - Notification Logic
+        // ✅ ========================================
+        console.log("\n📊 Checking for offline participants...");
+
+        const onlineSocketIds = room ? Array.from(room) : [];
+        console.log(`   Online sockets in room: ${onlineSocketIds.length}`);
+
+        // Loop through all participants
+        for (const participant of conversation.participants) {
+          // Skip the sender
+          if (
+            participant.id === socket.user.id &&
+            participant.type === socket.user.type
+          ) {
+            console.log(`   ⏭️  Skipping sender: ${participant.name}`);
+            continue;
+          }
+
+          // Get participant's socket ID from connectedUsers map
+          const participantKey = `${participant.id}_${participant.type}`;
+          const participantSocketId = connectedUsers.get(participantKey);
+
+          // Check if participant is online in this conversation room
+          const isOnlineInRoom =
+            participantSocketId &&
+            onlineSocketIds.includes(participantSocketId);
+
+          console.log(`   👤 Participant: ${participant.name}`);
+          console.log(`      User Key: ${participantKey}`);
+          console.log(`      Socket ID: ${participantSocketId || "none"}`);
+          console.log(`      In Room: ${isOnlineInRoom ? "Yes ✅" : "No ❌"}`);
+
+          // If participant is offline or not in room, create notification
+          if (!isOnlineInRoom) {
+            console.log(
+              `   📝 Creating notification for ${participant.name}...`,
+            );
+
+            try {
+              const notification = await Notification.create({
+                userId: participant.id,
+                userType: participant.type,
+                type: "new_message",
+                conversationId: conversationId,
+                messageId: newMessage._id,
+                data: {
+                  senderName: socket.user.name,
+                  message: message.trim().substring(0, 100),
+                  conversationName:
+                    conversation.name || `${socket.user.name}'s conversation`,
+                },
+              });
+
+              console.log(
+                `   ✅ Notification created: ${notification._id} for ${participant.name}`,
+              );
+            } catch (notifError) {
+              console.error(
+                `   ❌ Failed to create notification for ${participant.name}:`,
+                notifError.message,
+              );
+            }
+          } else {
+            console.log(
+              `   ✅ ${participant.name} is online in room, no notification needed`,
+            );
+          }
+        }
+
+        console.log("📊 Notification check completed\n");
+        // ✅ ========================================
+        // ✅ END OF NOTIFICATION SECTION
+        // ✅ ========================================
+
+        // ✅ Emit to all users in room (including sender)
+        io.to(roomName).emit("new_message", {
           message: newMessage,
           conversation: {
             _id: conversation._id,
@@ -300,10 +457,15 @@ const chatHandler = (io) => {
           },
         });
 
+        console.log("✅ new_message event emitted to room");
+
+        // Confirmation to sender
         socket.emit("message_sent", {
           success: true,
           message: newMessage,
         });
+
+        console.log("✅ message_sent confirmation sent to sender");
       } catch (error) {
         logger.error("Send message error:", error);
         socket.emit("error", { message: "Failed to send message" });

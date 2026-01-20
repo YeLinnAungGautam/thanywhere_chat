@@ -30,13 +30,13 @@ router.get("/", authMiddleware, async (req, res) => {
         const unreadCount = await Message.getUnreadCount(
           conv._id,
           req.user.id,
-          req.user.type
+          req.user.type,
         );
         return {
           ...conv,
           unreadCount,
         };
-      })
+      }),
     );
 
     res.json({
@@ -75,7 +75,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
     const unreadCount = await Message.getUnreadCount(
       conversation._id,
       req.user.id,
-      req.user.type
+      req.user.type,
     );
 
     res.json({
@@ -115,7 +115,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
     // Add current user to participants
     const currentUserIncluded = participants.some(
-      (p) => p.id === req.user.id && p.type === req.user.type
+      (p) => p.id === req.user.id && p.type === req.user.type,
     );
 
     const allParticipants = currentUserIncluded
@@ -207,6 +207,25 @@ router.post("/", authMiddleware, async (req, res) => {
       id: conversation._id,
       type: conversation.type,
     });
+
+    // ✅ ADD THIS - Emit socket event to all participants
+    if (req.io) {
+      allParticipants.forEach((participant) => {
+        const roomName = `user_${participant.id}_${participant.type}`;
+
+        req.io.emit(roomName, {
+          event: "new_conversation",
+          conversation: conversation.toObject(),
+          message: `New conversation: ${conversation.name || "Chat"}`,
+          timestamp: new Date(),
+        });
+      });
+
+      logger.info(
+        "Socket events sent to participants:",
+        allParticipants.length,
+      );
+    }
 
     res.status(201).json({
       success: true,
@@ -327,7 +346,7 @@ router.delete(
         error: "Server error",
       });
     }
-  }
+  },
 );
 
 // Delete conversation

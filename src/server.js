@@ -11,6 +11,7 @@ const mongoose = require("mongoose");
 const authRoutes = require("./routes/auth");
 const conversationRoutes = require("./routes/conversations");
 const messageRoutes = require("./routes/messages");
+const notificationRoutes = require("./routes/notifications");
 
 // Socket handler
 const chatHandler = require("./socket/chatHandler");
@@ -35,11 +36,17 @@ app.use(
   cors({
     origin: process.env.ALLOWED_ORIGINS.split(","),
     credentials: true,
-  })
+  }),
 );
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ✅ ADD THIS - Make io available to all routes
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
 
 // Request logging
 app.use((req, res, next) => {
@@ -62,6 +69,7 @@ app.get("/health", (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/conversations", conversationRoutes);
 app.use("/api/messages", messageRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 // 404 handler
 app.use((req, res) => {
